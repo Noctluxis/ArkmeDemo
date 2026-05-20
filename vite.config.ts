@@ -45,6 +45,41 @@ function arrangementRecognitionPlugin(env: RecognitionEnv): Plugin {
             return;
           }
 
+          if (requestUrl === "/api/arrangements/recognize-completion") {
+            if (req.method !== "POST") {
+              writeJson(res, 405, { message: "完成识别只支持 POST" });
+              return;
+            }
+
+            const config = getRecognitionConfig(env);
+            if (!config.apiKey) {
+              writeJson(res, 400, {
+                code: "not-configured",
+                message: "请先在 .env 中配置 ARKME_LLM_API_KEY",
+              });
+              return;
+            }
+
+            const body = await readJsonBody(req);
+            const message = normalizeCompletionMessage(body);
+            const arrangements = normalizeCompletionArrangements(body);
+            if (!message || arrangements.length === 0) {
+              writeJson(res, 400, {
+                message: "缺少可用于完成识别的新消息或本地安排",
+              });
+              return;
+            }
+
+            const result = await requestCompletionRecognition(
+              config,
+              message,
+              arrangements,
+              body
+            );
+            writeJson(res, 200, { result });
+            return;
+          }
+
           if (requestUrl !== "/api/arrangements/recognize") {
             writeJson(res, 404, { message: "未找到安排识别接口" });
             return;
@@ -144,6 +179,47 @@ async function requestRecognition(
   }
 }
 
+async function requestCompletionRecognition(
+  config: ReturnType<typeof getRecognitionConfig>,
+  message: CompletionMessagePayload,
+  arrangements: CompletionArrangementPayload[],
+  body: Record<string, unknown>
+) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), config.timeoutMs);
+
+  try {
+    const response = await fetch(
+      `${config.baseUrl.replace(/\/+$/, "")}/chat/completions`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${config.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: config.model,
+          messages: buildCompletionRecognitionMessages(message, arrangements, body),
+          temperature: 0,
+          response_format: { type: "json_object" },
+          thinking: { type: config.thinking },
+        }),
+        signal: controller.signal,
+      }
+    );
+
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new Error(getRemoteErrorMessage(payload));
+    }
+
+    const content = readAssistantContent(payload);
+    return normalizeAssistantRecognitionPayload(parseAssistantJson(content));
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 function buildRecognitionMessages(
   sources: RecognitionSourcePayload[],
   body: Record<string, unknown>
@@ -205,6 +281,66 @@ function buildRecognitionMessages(
   ];
 }
 
+function buildCompletionRecognitionMessages(
+  message: CompletionMessagePayload,
+  arrangements: CompletionArrangementPayload[],
+  body: Record<string, unknown>
+) {
+  const currentTime =
+    typeof body.currentTime === "string" ? body.currentTime : new Date().toISOString();
+  const currentTimeUtc =
+    typeof body.currentTimeUtc === "string" ? body.currentTimeUtc : new Date().toISOString();
+  const timeZone = typeof body.timeZone === "string" ? body.timeZone : "local time";
+  const timezoneOffsetMinutes =
+    typeof body.timezoneOffsetMinutes === "number"
+      ? body.timezoneOffsetMinutes
+      : null;
+  const locale = typeof body.locale === "string" ? body.locale : "zh-CN";
+
+  return [
+    {
+      role: "system",
+      content:
+        "你是即我 Demo 的安排完成识别器。你的唯一任务是判断一条新的聊天消息是否明确表示某一个已有安排已经完成。必须返回严格 JSON，不要输出解释文字。",
+    },
+    {
+      role: "system",
+      content:
+        "高置信原则：宁可漏报，不可误报。只有消息明确表达已经做完、已经确认、已经去过、已经处理好等已完成事实时才返回 isCompleted=true。未来计划、提醒、询问、打算、需要改时间、还没完成、多个候选接近、证据不足，一律返回 isCompleted=false。最多匹配一条安排。",
+    },
+    {
+      role: "user",
+      content: JSON.stringify(
+        {
+          currentTime,
+          currentTimeUtc,
+          timeZone,
+          timezoneOffsetMinutes,
+          locale,
+          eligibilityRules: [
+            "All arrangements are provided for context.",
+            "Only arrangements with status active or later can be returned as the target.",
+            "Arrangements with status completed or merged must never be returned as the target.",
+            "Return confidence as a number from 0 to 1.",
+            "Use confidence >= 0.9 only when the message directly states completion and the target arrangement is unambiguous.",
+          ],
+          outputSchema: {
+            isCompleted: "boolean",
+            arrangementId: "string, empty when no high-confidence match",
+            confidence: "number from 0 to 1",
+            evidence: "exact short evidence from the new message, empty when no match",
+            reason: "short Chinese reason",
+          },
+          newMessage: message,
+          arrangements,
+        },
+        null,
+        2
+      ),
+    },
+  ];
+}
+
 function parseAssistantJson(content: string) {
   try {
     return JSON.parse(content) as unknown;
@@ -257,6 +393,32 @@ type RecognitionSourcePayload = {
   createdAt: number;
 };
 
+type CompletionMessagePayload = {
+  id: string;
+  type: string;
+  title: string;
+  text: string;
+  createdAt: number;
+};
+
+type CompletionArrangementPayload = {
+  id: string;
+  title: string;
+  description: string;
+  status: string;
+  timeKind: string;
+  dueAt: number | null;
+  startAt: number | null;
+  endAt: number | null;
+  location: string;
+  people: string[];
+  reminderNote: string;
+  sourceRefs: unknown[];
+  executionLevel: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
 function normalizeSources(body: Record<string, unknown>) {
   const sources = body.sources;
   if (!Array.isArray(sources)) return [];
@@ -277,6 +439,74 @@ function normalizeSources(body: Record<string, unknown>) {
       };
     })
     .filter((source): source is RecognitionSourcePayload => source !== null);
+}
+
+function normalizeCompletionMessage(
+  body: Record<string, unknown>
+): CompletionMessagePayload | null {
+  const message = body.message;
+  if (!message || typeof message !== "object") return null;
+  const item = message as Partial<CompletionMessagePayload>;
+  if (!item.id || !item.type || !item.text) return null;
+
+  return {
+    id: String(item.id),
+    type: String(item.type),
+    title: typeof item.title === "string" ? item.title : "聊天消息",
+    text: String(item.text),
+    createdAt:
+      typeof item.createdAt === "number" && Number.isFinite(item.createdAt)
+        ? item.createdAt
+        : Date.now(),
+  };
+}
+
+function normalizeCompletionArrangements(body: Record<string, unknown>) {
+  const arrangements = body.arrangements;
+  if (!Array.isArray(arrangements)) return [];
+
+  return arrangements
+    .map((arrangement): CompletionArrangementPayload | null => {
+      if (!arrangement || typeof arrangement !== "object") return null;
+      const item = arrangement as Partial<CompletionArrangementPayload>;
+      if (!item.id || !item.title || !item.status) return null;
+
+      return {
+        id: String(item.id),
+        title: String(item.title),
+        description: typeof item.description === "string" ? item.description : "",
+        status: String(item.status),
+        timeKind: typeof item.timeKind === "string" ? item.timeKind : "none",
+        dueAt: normalizeNullableNumber(item.dueAt),
+        startAt: normalizeNullableNumber(item.startAt),
+        endAt: normalizeNullableNumber(item.endAt),
+        location: typeof item.location === "string" ? item.location : "",
+        people: Array.isArray(item.people)
+          ? item.people.filter((person): person is string => typeof person === "string")
+          : [],
+        reminderNote:
+          typeof item.reminderNote === "string" ? item.reminderNote : "",
+        sourceRefs: Array.isArray(item.sourceRefs) ? item.sourceRefs : [],
+        executionLevel:
+          typeof item.executionLevel === "string" ? item.executionLevel : "user-only",
+        createdAt:
+          typeof item.createdAt === "number" && Number.isFinite(item.createdAt)
+            ? item.createdAt
+            : Date.now(),
+        updatedAt:
+          typeof item.updatedAt === "number" && Number.isFinite(item.updatedAt)
+            ? item.updatedAt
+            : Date.now(),
+      };
+    })
+    .filter(
+      (arrangement): arrangement is CompletionArrangementPayload =>
+        arrangement !== null
+    );
+}
+
+function normalizeNullableNumber(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 async function readJsonBody(req: IncomingMessage) {
