@@ -2,18 +2,27 @@ import {
   createArrangementItem,
   createDemoRecognitionArrangement,
   applyAutomaticArrangementRules,
+  acceptCompletionSuggestion,
+  acceptMergeSuggestion,
+  buildCalendarBuckets,
+  findCompletionSuggestion,
+  findMergeSuggestions,
+  getReminderOccurrences,
   groupArrangementItems,
   searchArrangementItems,
 } from "@/data/arrangements";
 import type { ArrangementItem } from "@/data/arrangements";
 import {
   buildRecognitionSourceFromRecord,
+  createCompletionSuggestionFromRecognitionResult,
   createArrangementPendingConfirmation,
   createAutoRecognizedArrangement,
   createArrangementDraft,
   createArrangementRecognitionRequestContext,
   createArrangementInputFromDraft,
+  normalizeCompletionRecognitionResultPayload,
   normalizeRecognitionResultPayload,
+  shouldPromptCompletionSuggestion,
   shouldPromptArrangementRecognitionDraft,
 } from "@/data/arrangementRecognition";
 import type { RecordItem } from "@/types/record";
@@ -262,4 +271,299 @@ if (
   recognitionRequestContext.timezoneOffsetMinutes !== -480
 ) {
   throw new Error("Arrangement recognition timezone contract failed");
+}
+
+const calendarStart = new Date("2026-05-01T00:00:00+08:00").getTime();
+const calendarEnd = new Date("2026-05-31T23:59:59+08:00").getTime();
+const calendarDue = createArrangementItem(
+  {
+    title: "calendar due",
+    timeKind: "due",
+    dueAt: new Date("2026-05-10T15:00:00+08:00").getTime(),
+  },
+  contractNow + 5000
+);
+const calendarRange = createArrangementItem(
+  {
+    title: "calendar range",
+    timeKind: "range",
+    startAt: new Date("2026-05-12T20:00:00+08:00").getTime(),
+    endAt: new Date("2026-05-13T10:00:00+08:00").getTime(),
+  },
+  contractNow + 6000
+);
+const calendarNone = createArrangementItem(
+  {
+    title: "calendar none",
+    timeKind: "none",
+  },
+  contractNow + 7000
+);
+const calendarBuckets = buildCalendarBuckets(
+  [calendarDue, calendarRange, calendarNone],
+  calendarStart,
+  calendarEnd
+);
+
+if (
+  calendarBuckets.find((bucket) => bucket.dateKey === "2026-05-10")
+    ?.arrangements[0]?.id !== calendarDue.id ||
+  !calendarBuckets
+    .find((bucket) => bucket.dateKey === "2026-05-13")
+    ?.arrangements.some((arrangement) => arrangement.id === calendarRange.id) ||
+  calendarBuckets.some((bucket) =>
+    bucket.arrangements.some((arrangement) => arrangement.id === calendarNone.id)
+  )
+) {
+  throw new Error("Arrangement calendar bucket contract failed");
+}
+
+const reminderArrangement = createArrangementItem(
+  {
+    title: "reminder due",
+    timeKind: "due",
+    dueAt: new Date("2026-05-20T10:30:00+08:00").getTime(),
+    reminderRules: [
+      {
+        id: "before-30",
+        type: "before",
+        enabled: true,
+        offsetMinutes: 30,
+        createdAt: contractNow,
+        updatedAt: contractNow,
+      },
+      {
+        id: "same-day-9",
+        type: "same-day",
+        enabled: true,
+        timeOfDayMinutes: 9 * 60,
+        createdAt: contractNow,
+        updatedAt: contractNow,
+      },
+      {
+        id: "daily-9",
+        type: "recurring",
+        enabled: true,
+        recurrence: "daily",
+        timeOfDayMinutes: 9 * 60,
+        createdAt: contractNow,
+        updatedAt: contractNow,
+      },
+    ],
+  },
+  contractNow + 8000
+);
+const reminderOccurrences = getReminderOccurrences(
+  [reminderArrangement],
+  new Date("2026-05-20T10:05:00+08:00").getTime()
+);
+
+if (
+  !reminderOccurrences.some((occurrence) => occurrence.rule.type === "before") ||
+  !reminderOccurrences.some((occurrence) => occurrence.rule.type === "same-day") ||
+  !reminderOccurrences.some((occurrence) => occurrence.rule.type === "recurring")
+) {
+  throw new Error("Arrangement reminder occurrence contract failed");
+}
+
+const yesterdayReminderOccurrences = getReminderOccurrences(
+  [
+    createArrangementItem(
+      {
+        title: "yesterday reminder",
+        timeKind: "due",
+        dueAt: new Date("2026-05-19T10:30:00+08:00").getTime(),
+        reminderRules: [
+          {
+            id: "yesterday-same-day",
+            type: "same-day",
+            enabled: true,
+            timeOfDayMinutes: 9 * 60,
+            createdAt: contractNow,
+            updatedAt: contractNow,
+          },
+        ],
+      },
+      contractNow + 8500
+    ),
+  ],
+  new Date("2026-05-20T10:05:00+08:00").getTime()
+);
+
+if (yesterdayReminderOccurrences.length > 0) {
+  throw new Error("Arrangement same-day reminder should only show today");
+}
+
+const hospitalPrimary = createArrangementItem(
+  {
+    title: "去医院体检",
+    description: "周五上午去医院体检",
+    timeKind: "due",
+    dueAt: new Date("2026-05-22T09:00:00+08:00").getTime(),
+    location: "医院",
+    sourceRefs: [
+      {
+        id: "hospital-source-1",
+        type: "self",
+        title: "发给自己",
+        excerpt: "周五上午去医院体检",
+        createdAt: contractNow,
+      },
+    ],
+  },
+  contractNow + 9000
+);
+const hospitalCandidate = createArrangementItem(
+  {
+    title: "医院复查",
+    description: "别忘了体检后复查",
+    timeKind: "due",
+    dueAt: new Date("2026-05-22T11:00:00+08:00").getTime(),
+    location: "医院",
+    sourceRefs: [
+      {
+        id: "hospital-source-2",
+        type: "private",
+        title: "用户A",
+        excerpt: "体检之后还要去医院复查",
+        createdAt: contractNow,
+      },
+    ],
+  },
+  contractNow + 10000
+);
+const mergeSuggestions = findMergeSuggestions([
+  hospitalCandidate,
+  hospitalPrimary,
+]);
+const hospitalMergeSuggestion = mergeSuggestions[0];
+const mergedArrangements = hospitalMergeSuggestion
+  ? acceptMergeSuggestion(
+      [hospitalPrimary, hospitalCandidate],
+      hospitalMergeSuggestion,
+      contractNow + 11000
+    )
+  : [];
+const mergedPrimary = mergedArrangements.find(
+  (arrangement) => arrangement.id === hospitalMergeSuggestion?.primaryArrangementId
+);
+const mergedCandidate = mergedArrangements.find(
+  (arrangement) => arrangement.id === hospitalCandidate.id
+);
+
+if (
+  !hospitalMergeSuggestion ||
+  mergedCandidate?.status !== "merged" ||
+  mergedCandidate.mergedIntoId !== hospitalMergeSuggestion.primaryArrangementId ||
+  (mergedPrimary?.sourceRefs.length ?? 0) < 2
+) {
+  throw new Error("Arrangement merge suggestion contract failed");
+}
+
+const unrelatedMergeSuggestions = findMergeSuggestions([
+  hospitalPrimary,
+  createArrangementItem(
+    {
+      title: "客户会议资料确认",
+      description: "整理会议材料并确认客户时间",
+      timeKind: "due",
+      dueAt: new Date("2026-05-22T10:00:00+08:00").getTime(),
+      location: "办公室",
+      people: ["客户"],
+    },
+    contractNow + 12000
+  ),
+]);
+
+if (unrelatedMergeSuggestions.length > 0) {
+  throw new Error("Arrangement conservative merge contract failed");
+}
+
+const completionSuggestion = findCompletionSuggestion(
+  [hospitalPrimary],
+  {
+    id: "completion-message-1",
+    type: "self",
+    title: "发给自己",
+    text: "我今天上午去医院体检了",
+    createdAt: new Date("2026-05-22T12:00:00+08:00").getTime(),
+  },
+  new Date("2026-05-22T12:00:00+08:00").getTime()
+);
+const completedArrangements = completionSuggestion
+  ? acceptCompletionSuggestion(
+      [hospitalPrimary],
+      completionSuggestion,
+      new Date("2026-05-22T12:05:00+08:00").getTime()
+    )
+  : [];
+
+if (
+  !completionSuggestion ||
+  completedArrangements.find((arrangement) => arrangement.id === hospitalPrimary.id)
+    ?.status !== "completed"
+) {
+  throw new Error("Arrangement completion suggestion contract failed");
+}
+
+const llmCompletionMessage = {
+  id: "completion-message-llm-1",
+  type: "self" as const,
+  title: "发给自己",
+  text: "我刚刚已经和客户把报价报告确认完了。",
+  createdAt: new Date("2026-05-22T12:30:00+08:00").getTime(),
+};
+const llmCompletionArrangement = createArrangementItem(
+  {
+    title: "客户报价报告确认",
+    description: "和客户确认报价报告最终版本",
+    timeKind: "due",
+    dueAt: new Date("2026-05-22T18:00:00+08:00").getTime(),
+    location: "线上",
+    people: ["客户"],
+  },
+  contractNow + 13000
+);
+const llmCompletionResult = normalizeCompletionRecognitionResultPayload({
+  isCompleted: true,
+  arrangementId: llmCompletionArrangement.id,
+  confidence: 0.94,
+  evidence: "已经和客户把报价报告确认完了",
+  reason: "新消息明确表示客户报价报告确认已经完成。",
+});
+const llmCompletionSuggestion = llmCompletionResult
+  ? createCompletionSuggestionFromRecognitionResult(
+      llmCompletionResult,
+      llmCompletionMessage,
+      [llmCompletionArrangement],
+      llmCompletionMessage.createdAt
+    )
+  : null;
+
+if (
+  !llmCompletionResult ||
+  !shouldPromptCompletionSuggestion(llmCompletionResult, [
+    llmCompletionArrangement,
+  ]) ||
+  llmCompletionSuggestion?.arrangementId !== llmCompletionArrangement.id ||
+  llmCompletionSuggestion.confidence !== "high"
+) {
+  throw new Error("LLM completion suggestion high-confidence contract failed");
+}
+
+const lowConfidenceCompletionResult = normalizeCompletionRecognitionResultPayload({
+  isCompleted: true,
+  arrangementId: llmCompletionArrangement.id,
+  confidence: 0.86,
+  evidence: "可能确认了",
+  reason: "表达不够确定。",
+});
+
+if (
+  lowConfidenceCompletionResult &&
+  shouldPromptCompletionSuggestion(lowConfidenceCompletionResult, [
+    llmCompletionArrangement,
+  ])
+) {
+  throw new Error("LLM completion suggestion confidence threshold contract failed");
 }

@@ -14,15 +14,18 @@ import {
   createArrangementPendingConfirmation,
   getInitialArrangementAutoRecognitionEnabled,
   persistArrangementAutoRecognitionEnabled,
+  recognizeArrangementCompletion,
   recognizeArrangementSources,
   shouldPromptArrangementRecognitionDraft,
   type ArrangementPendingConfirmation,
   type ArrangementRecognitionSourceType,
 } from "@/data/arrangementRecognition";
 import {
+  acceptCompletionSuggestion,
   getInitialArrangements,
   persistArrangements,
   upsertArrangement,
+  type CompletionSuggestion,
 } from "@/data/arrangements";
 import { useCandidateProfile } from "@/data/candidateProfile";
 import {
@@ -387,9 +390,14 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
     pendingArrangementConfirmation,
     setPendingArrangementConfirmation,
   ] = React.useState<ArrangementPendingConfirmation | null>(null);
+  const [
+    pendingCompletionSuggestion,
+    setPendingCompletionSuggestion,
+  ] = React.useState<CompletionSuggestion | null>(null);
   const initializedBrowserNotificationMessagesRef = React.useRef(false);
   const browserNotifiedMessageIdsRef = React.useRef<Set<string>>(new Set());
   const autoRecognitionCandidateIdsRef = React.useRef<Set<string>>(new Set());
+  const completionSuggestionCandidateIdsRef = React.useRef<Set<string>>(new Set());
 
   const unreadAiConversationCount = Math.max(
     0,
@@ -611,7 +619,7 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
       if (!arrangementAutoRecognitionEnabled || !record.text_content.trim()) {
         return;
       }
-      if (pendingArrangementConfirmation) {
+      if (pendingArrangementConfirmation || pendingCompletionSuggestion) {
         return;
       }
       if (autoRecognitionCandidateIdsRef.current.has(record.uid)) {
@@ -621,10 +629,31 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
       autoRecognitionCandidateIdsRef.current.add(record.uid);
 
       try {
+        const existingArrangements = getInitialArrangements(Date.now());
+        if (!completionSuggestionCandidateIdsRef.current.has(record.uid)) {
+          try {
+            const completionSuggestion = await recognizeArrangementCompletion(
+              {
+                id: record.uid,
+                type,
+                title: record.sourceConversation?.label ?? "聊天消息",
+                text: record.text_content,
+                createdAt: record.send_at,
+              },
+              existingArrangements
+            );
+            if (completionSuggestion) {
+              setPendingCompletionSuggestion(completionSuggestion);
+              return;
+            }
+          } catch {
+            // Completion recognition should stay conservative and silent.
+          }
+          completionSuggestionCandidateIdsRef.current.add(record.uid);
+        }
         const source = buildRecognitionSourceFromRecord(record, type);
         const draft = await recognizeArrangementSources([source]);
         if (!shouldPromptArrangementRecognitionDraft(draft)) return;
-        const existingArrangements = getInitialArrangements(Date.now());
         const nextArrangement = createAutoRecognizedArrangement(
           existingArrangements,
           draft
@@ -637,7 +666,11 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
         autoRecognitionCandidateIdsRef.current.delete(record.uid);
       }
     },
-    [arrangementAutoRecognitionEnabled, pendingArrangementConfirmation]
+    [
+      arrangementAutoRecognitionEnabled,
+      pendingArrangementConfirmation,
+      pendingCompletionSuggestion,
+    ]
   );
 
   const confirmPendingArrangement = React.useCallback(() => {
@@ -657,6 +690,19 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
 
   const cancelPendingArrangement = React.useCallback(() => {
     setPendingArrangementConfirmation(null);
+  }, []);
+
+  const confirmPendingCompletion = React.useCallback(() => {
+    if (!pendingCompletionSuggestion) return;
+    const existingArrangements = getInitialArrangements(Date.now());
+    persistArrangements(
+      acceptCompletionSuggestion(existingArrangements, pendingCompletionSuggestion)
+    );
+    setPendingCompletionSuggestion(null);
+  }, [pendingCompletionSuggestion]);
+
+  const cancelPendingCompletion = React.useCallback(() => {
+    setPendingCompletionSuggestion(null);
   }, []);
 
   React.useEffect(() => {
@@ -1361,6 +1407,11 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
             onConfirm={confirmPendingArrangement}
             onCancel={cancelPendingArrangement}
           />
+          <ArrangementCompletionConfirmDialog
+            suggestion={pendingCompletionSuggestion}
+            onConfirm={confirmPendingCompletion}
+            onCancel={cancelPendingCompletion}
+          />
         </div>
       }
     />
@@ -1450,6 +1501,70 @@ function ArrangementRecognitionConfirmDialog({
             className="h-11 rounded-[12px] bg-primary text-sm font-semibold text-on-primary shadow-sm transition hover:bg-primary-hover active:scale-[0.98]"
           >
             确认加入
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ArrangementCompletionConfirmDialog({
+  suggestion,
+  onConfirm,
+  onCancel,
+}: {
+  suggestion: CompletionSuggestion | null;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  if (!suggestion) return null;
+
+  const arrangement = getInitialArrangements(Date.now()).find(
+    (item) => item.id === suggestion.arrangementId
+  );
+  const source = suggestion.sourceRefs[0];
+
+  if (!arrangement || !source) return null;
+
+  return (
+    <div className="absolute inset-0 z-50 flex items-end justify-center">
+      <button
+        type="button"
+        className="absolute inset-0 bg-overlay-light"
+        onClick={onCancel}
+        aria-label="取消完成确认"
+      />
+      <section className="relative z-10 w-full rounded-t-[18px] bg-bg px-4 pb-5 pt-4 shadow-lift">
+        <div className="mb-3 flex items-start justify-between gap-3">
+          <div>
+            <p className="text-xs font-semibold text-primary">可能已完成</p>
+            <h2 className="mt-1 text-lg font-semibold leading-6 text-text">
+              {arrangement.title}
+            </h2>
+          </div>
+          <span className="rounded-full bg-primary-soft px-2 py-1 text-xs font-semibold text-primary">
+            需确认
+          </span>
+        </div>
+        <p className="text-sm leading-6 text-text-muted">{suggestion.reason}</p>
+        <div className="mt-3 rounded-[12px] border border-border bg-surface px-3 py-2">
+          <p className="text-xs font-medium text-text-tertiary">{source.title}</p>
+          <p className="mt-1 text-sm leading-6 text-text">{source.excerpt}</p>
+        </div>
+        <div className="mt-4 grid grid-cols-2 gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="h-11 rounded-full bg-surface text-sm font-semibold text-text shadow-[var(--mine-card-shadow)] transition active:scale-[0.98]"
+          >
+            先不处理
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            className="h-11 rounded-full bg-primary text-sm font-semibold text-on-primary shadow-[var(--mine-card-shadow)] transition active:scale-[0.98]"
+          >
+            确认完成
           </button>
         </div>
       </section>

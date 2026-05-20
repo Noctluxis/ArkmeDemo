@@ -3,6 +3,8 @@ import type {
   ArrangementInput,
   ArrangementSourceRef,
   ArrangementTimeKind,
+  CompletionRecognitionMessage,
+  CompletionSuggestion,
 } from "@/data/arrangements";
 import { createArrangementItem } from "@/data/arrangements";
 import type { RecordItem } from "@/types/record";
@@ -37,6 +39,20 @@ export type AiRecognitionResult = {
   people: string[];
   confidence: AiRecognitionConfidence;
   reason: string;
+};
+
+export type AiCompletionRecognitionResult = {
+  isCompleted: boolean;
+  arrangementId: string;
+  confidence: number;
+  evidence: string;
+  reason: string;
+};
+
+export type ArrangementCompletionRecognitionRequest = {
+  message: CompletionRecognitionMessage;
+  arrangements: ArrangementItem[];
+  context: ArrangementRecognitionRequestContext;
 };
 
 export type ArrangementDraft = {
@@ -150,6 +166,57 @@ export function shouldPromptArrangementRecognitionDraft(draft: ArrangementDraft)
   return draft.result.confidence === "high";
 }
 
+export function shouldPromptCompletionSuggestion(
+  result: AiCompletionRecognitionResult,
+  arrangements: ArrangementItem[]
+) {
+  const matchedArrangement = arrangements.find(
+    (arrangement) => arrangement.id === result.arrangementId
+  );
+
+  return (
+    result.isCompleted &&
+    result.confidence >= 0.9 &&
+    Boolean(result.evidence) &&
+    Boolean(result.reason) &&
+    Boolean(matchedArrangement) &&
+    isCompletionEligibleArrangement(matchedArrangement)
+  );
+}
+
+export function createCompletionSuggestionFromRecognitionResult(
+  result: AiCompletionRecognitionResult,
+  message: CompletionRecognitionMessage,
+  arrangements: ArrangementItem[],
+  now = Date.now()
+): CompletionSuggestion | null {
+  if (!shouldPromptCompletionSuggestion(result, arrangements)) return null;
+
+  const matchedArrangement = arrangements.find(
+    (arrangement) => arrangement.id === result.arrangementId
+  );
+  if (!matchedArrangement) return null;
+
+  return {
+    id: `completion-${message.id}-${matchedArrangement.id}`,
+    arrangementId: matchedArrangement.id,
+    sourceRefs: [
+      {
+        id: message.id,
+        type: message.type,
+        title: message.title,
+        excerpt: message.text,
+        createdAt: message.createdAt,
+      },
+    ],
+    reason: result.reason,
+    confidence: "high",
+    status: "pending",
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
 export function createAutoRecognizedArrangement(
   existingArrangements: ArrangementItem[],
   draft: ArrangementDraft,
@@ -206,6 +273,42 @@ export async function recognizeArrangementSources(
   }
 
   return createArrangementDraft(sources, result);
+}
+
+export async function recognizeArrangementCompletion(
+  message: CompletionRecognitionMessage,
+  arrangements: ArrangementItem[]
+) {
+  const requestContext = createArrangementRecognitionRequestContext();
+  const response = await fetch("/api/arrangements/recognize-completion", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      ...requestContext,
+      message,
+      arrangements: arrangements.map(toCompletionArrangementPayload),
+    }),
+  });
+  const payload: unknown = await response.json();
+
+  if (!response.ok) {
+    throw new Error(getErrorMessage(payload, "AI 完成识别失败"));
+  }
+
+  const resultPayload =
+    payload && typeof payload === "object" && "result" in payload
+      ? (payload as { result?: unknown }).result
+      : payload;
+  const result = normalizeCompletionRecognitionResultPayload(resultPayload);
+  if (!result) return null;
+
+  return createCompletionSuggestionFromRecognitionResult(
+    result,
+    message,
+    arrangements
+  );
 }
 
 export function createArrangementRecognitionRequestContext(
@@ -266,6 +369,30 @@ export function normalizeRecognitionResultPayload(
   return normalizeRecognitionResult(unwrappedValue);
 }
 
+export function normalizeCompletionRecognitionResultPayload(
+  value: unknown
+): AiCompletionRecognitionResult | null {
+  const unwrappedValue =
+    value &&
+    typeof value === "object" &&
+    "outputSchema" in value &&
+    (value as { outputSchema?: unknown }).outputSchema
+      ? (value as { outputSchema?: unknown }).outputSchema
+      : value;
+
+  if (!unwrappedValue || typeof unwrappedValue !== "object") return null;
+  const result = unwrappedValue as Partial<AiCompletionRecognitionResult>;
+  const confidence = normalizeCompletionConfidence(result.confidence);
+
+  return {
+    isCompleted: result.isCompleted === true,
+    arrangementId: normalizeText(result.arrangementId),
+    confidence,
+    evidence: normalizeText(result.evidence),
+    reason: normalizeText(result.reason),
+  };
+}
+
 function normalizeRecognitionResult(value: unknown): AiRecognitionResult | null {
   if (!value || typeof value !== "object") return null;
   const result = value as Partial<AiRecognitionResult>;
@@ -309,6 +436,39 @@ function normalizeTimestamp(value: unknown) {
   if (typeof value !== "string" || !value.trim()) return null;
   const timestamp = new Date(value).getTime();
   return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function normalizeCompletionConfidence(value: unknown) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return 0;
+  if (value > 1 && value <= 100) return value / 100;
+  return Math.min(Math.max(value, 0), 1);
+}
+
+function isCompletionEligibleArrangement(arrangement: ArrangementItem | undefined) {
+  return (
+    arrangement?.status === "active" ||
+    arrangement?.status === "later"
+  );
+}
+
+function toCompletionArrangementPayload(arrangement: ArrangementItem) {
+  return {
+    id: arrangement.id,
+    title: arrangement.title,
+    description: arrangement.description,
+    status: arrangement.status,
+    timeKind: arrangement.timeKind,
+    dueAt: arrangement.dueAt,
+    startAt: arrangement.startAt,
+    endAt: arrangement.endAt,
+    location: arrangement.location,
+    people: arrangement.people,
+    reminderNote: arrangement.reminderNote,
+    sourceRefs: arrangement.sourceRefs,
+    executionLevel: arrangement.executionLevel,
+    createdAt: arrangement.createdAt,
+    updatedAt: arrangement.updatedAt,
+  };
 }
 
 function formatLocalIsoDateTime(
