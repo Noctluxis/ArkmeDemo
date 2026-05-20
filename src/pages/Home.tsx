@@ -5,8 +5,25 @@ import ChatInput from "@/components/ChatInput";
 import ChatList from "@/components/ChatList";
 import RecordDetailSheet from "@/components/RecordDetailSheet";
 import RecordFullDetailScreen from "@/components/RecordFullDetailScreen";
+import Arrangements from "@/pages/Arrangements";
 import Records from "@/pages/Records";
 import { aiConversationLogEntries } from "@/data/aiConversationLog";
+import {
+  buildRecognitionSourceFromRecord,
+  createAutoRecognizedArrangement,
+  createArrangementPendingConfirmation,
+  getInitialArrangementAutoRecognitionEnabled,
+  persistArrangementAutoRecognitionEnabled,
+  recognizeArrangementSources,
+  shouldPromptArrangementRecognitionDraft,
+  type ArrangementPendingConfirmation,
+  type ArrangementRecognitionSourceType,
+} from "@/data/arrangementRecognition";
+import {
+  getInitialArrangements,
+  persistArrangements,
+  upsertArrangement,
+} from "@/data/arrangements";
 import { useCandidateProfile } from "@/data/candidateProfile";
 import {
   createTestReplyMessage,
@@ -58,6 +75,7 @@ type TabItem = {
 const tabs: TabItem[] = [
   { key: "records" },
   { key: "insight" },
+  { key: "arrangements" },
   { key: "mine" },
 ];
 
@@ -361,8 +379,17 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
   const [testMessages, setTestMessages] = React.useState(getInitialTestMessages);
   const [testReadState, setTestReadState] =
     React.useState<TestReadState>(getInitialTestReadState);
+  const [
+    arrangementAutoRecognitionEnabled,
+    setArrangementAutoRecognitionEnabled,
+  ] = React.useState(getInitialArrangementAutoRecognitionEnabled);
+  const [
+    pendingArrangementConfirmation,
+    setPendingArrangementConfirmation,
+  ] = React.useState<ArrangementPendingConfirmation | null>(null);
   const initializedBrowserNotificationMessagesRef = React.useRef(false);
   const browserNotifiedMessageIdsRef = React.useRef<Set<string>>(new Set());
+  const autoRecognitionCandidateIdsRef = React.useRef<Set<string>>(new Set());
 
   const unreadAiConversationCount = Math.max(
     0,
@@ -564,6 +591,87 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
     [testConversationRecords]
   );
 
+  const updateArrangementAutoRecognitionEnabled = React.useCallback(
+    (enabled: boolean) => {
+      setArrangementAutoRecognitionEnabled(enabled);
+      persistArrangementAutoRecognitionEnabled(enabled);
+    },
+    []
+  );
+  const privateTestRecognitionRecords = React.useMemo<TestConversationRecord[]>(
+    () =>
+      testConversationRecords.filter((record) =>
+        record.sourceConversation?.conversationId?.startsWith("private:")
+      ),
+    [testConversationRecords]
+  );
+
+  const runArrangementAutoRecognition = React.useCallback(
+    async (record: RecordItem, type: ArrangementRecognitionSourceType) => {
+      if (!arrangementAutoRecognitionEnabled || !record.text_content.trim()) {
+        return;
+      }
+      if (pendingArrangementConfirmation) {
+        return;
+      }
+      if (autoRecognitionCandidateIdsRef.current.has(record.uid)) {
+        return;
+      }
+
+      autoRecognitionCandidateIdsRef.current.add(record.uid);
+
+      try {
+        const source = buildRecognitionSourceFromRecord(record, type);
+        const draft = await recognizeArrangementSources([source]);
+        if (!shouldPromptArrangementRecognitionDraft(draft)) return;
+        const existingArrangements = getInitialArrangements(Date.now());
+        const nextArrangement = createAutoRecognizedArrangement(
+          existingArrangements,
+          draft
+        );
+        if (!nextArrangement) return;
+        setPendingArrangementConfirmation(
+          createArrangementPendingConfirmation(draft)
+        );
+      } catch {
+        autoRecognitionCandidateIdsRef.current.delete(record.uid);
+      }
+    },
+    [arrangementAutoRecognitionEnabled, pendingArrangementConfirmation]
+  );
+
+  const confirmPendingArrangement = React.useCallback(() => {
+    if (!pendingArrangementConfirmation) return;
+    const existingArrangements = getInitialArrangements(Date.now());
+    const nextArrangement = createAutoRecognizedArrangement(
+      existingArrangements,
+      pendingArrangementConfirmation.draft
+    );
+    if (nextArrangement) {
+      persistArrangements(
+        upsertArrangement(existingArrangements, nextArrangement)
+      );
+    }
+    setPendingArrangementConfirmation(null);
+  }, [pendingArrangementConfirmation]);
+
+  const cancelPendingArrangement = React.useCallback(() => {
+    setPendingArrangementConfirmation(null);
+  }, []);
+
+  React.useEffect(() => {
+    if (!arrangementAutoRecognitionEnabled) return;
+    const latestIncomingPrivateRecord = [...privateTestRecognitionRecords]
+      .filter((record) => record.sender === "identity")
+      .sort((first, second) => second.send_at - first.send_at)[0];
+    if (!latestIncomingPrivateRecord) return;
+    void runArrangementAutoRecognition(latestIncomingPrivateRecord, "private");
+  }, [
+    arrangementAutoRecognitionEnabled,
+    privateTestRecognitionRecords,
+    runArrangementAutoRecognition,
+  ]);
+
   const testConversationSummaries = React.useMemo<TestConversationSummary[]>(
     () => {
       const privateSummaries = testIdentities
@@ -759,21 +867,25 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
 
   const createSelfRecord = React.useCallback((content: string) => {
     const timestamp = Date.now();
+    const uid = `self-${timestamp}`;
+    const record: RecordItem = {
+      uid,
+      text_content: content,
+      send_at: timestamp,
+      create_at: timestamp,
+      update_at: timestamp,
+      sourceConversation: makeSelfSource(uid),
+    };
     setCreatedSelfRecords((prev) => {
       const nextRecords = [
         ...prev,
-        {
-          uid: `self-${timestamp}`,
-          text_content: content,
-          send_at: timestamp,
-          create_at: timestamp,
-          update_at: timestamp,
-        },
+        record,
       ];
       persistCreatedSelfRecords(nextRecords);
       return nextRecords;
     });
-  }, []);
+    void runArrangementAutoRecognition(record, "self");
+  }, [makeSelfSource, runArrangementAutoRecognition]);
 
   const createRecordExtension = React.useCallback((parentRecord: RecordItem, content: string) => {
     const timestamp = Date.now();
@@ -1096,6 +1208,10 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
         <SettingsScreen
           onBack={() => setSettingsView(null)}
           onOpenAppearance={() => setSettingsView("appearance")}
+          arrangementAutoRecognitionEnabled={arrangementAutoRecognitionEnabled}
+          onChangeArrangementAutoRecognition={
+            updateArrangementAutoRecognitionEnabled
+          }
         />
       );
     }
@@ -1174,6 +1290,10 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
       return <InsightPreview />;
     }
 
+    if (currentPage === "arrangements") {
+      return <Arrangements />;
+    }
+
     return (
       <div className="flex h-full flex-col bg-bg">
         <MobileHeader
@@ -1236,10 +1356,154 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
             onClose={() => setRecordSnapshot(null)}
             onOpenSource={openSourceConversation}
           />
+          <ArrangementRecognitionConfirmDialog
+            pending={pendingArrangementConfirmation}
+            onConfirm={confirmPendingArrangement}
+            onCancel={cancelPendingArrangement}
+          />
         </div>
       }
     />
   );
+}
+
+function ArrangementRecognitionConfirmDialog({
+  pending,
+  onConfirm,
+  onCancel,
+}: {
+  pending: ArrangementPendingConfirmation | null;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  if (!pending) return null;
+
+  const { result, sourceRefs } = pending.draft;
+  const timeLabel = formatPendingArrangementTime(result);
+  const sourceText = sourceRefs.map((source) => source.title).join("、");
+
+  return (
+    <div className="absolute inset-0 z-50 flex items-end justify-center">
+      <button
+        type="button"
+        className="absolute inset-0 bg-black/20"
+        aria-label="取消安排确认"
+        onClick={onCancel}
+      />
+      <section className="relative z-10 max-h-[calc(100%-14px)] w-full overflow-y-auto rounded-t-[20px] border border-border bg-bg px-4 pb-4 pt-3.5 shadow-[0_-18px_50px_rgba(15,23,42,0.16)]">
+        <div className="mx-auto mb-3 h-1 w-10 rounded-full bg-border-strong" />
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-xs font-medium text-text-tertiary">识别到安排</p>
+            <h2 className="mt-1 break-words text-lg font-bold leading-6 text-text">
+              {result.title}
+            </h2>
+          </div>
+          <span className="shrink-0 rounded-full bg-accent-soft px-2 py-1 text-xs font-semibold text-accent">
+            {getPendingConfidenceLabel(result.confidence)}
+          </span>
+        </div>
+
+        {result.description && (
+          <p className="mt-3 rounded-[12px] bg-surface px-3 py-2 text-sm leading-6 text-text-secondary">
+            {result.description}
+          </p>
+        )}
+
+        <div className="mt-3 grid gap-2 text-sm">
+          <PendingArrangementMeta label="时间" value={timeLabel} />
+          {result.location && (
+            <PendingArrangementMeta label="地点" value={result.location} />
+          )}
+          {result.people.length > 0 && (
+            <PendingArrangementMeta label="相关人" value={result.people.join("、")} />
+          )}
+          {sourceText && <PendingArrangementMeta label="来源" value={sourceText} />}
+        </div>
+
+        {sourceRefs[0]?.excerpt && (
+          <div className="mt-3 rounded-[12px] border border-border bg-surface px-3 py-2">
+            <p className="text-xs font-medium text-text-tertiary">原文</p>
+            <p className="mt-1 text-sm leading-6 text-text-secondary">
+              {sourceRefs[0].excerpt}
+            </p>
+          </div>
+        )}
+
+        {result.reason && (
+          <p className="mt-2 text-xs leading-5 text-text-tertiary">
+            {result.reason}
+          </p>
+        )}
+
+        <div className="mt-4 grid grid-cols-2 gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="h-11 rounded-[12px] border border-border bg-surface text-sm font-semibold text-text-secondary transition active:scale-[0.98]"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            className="h-11 rounded-[12px] bg-primary text-sm font-semibold text-on-primary shadow-sm transition hover:bg-primary-hover active:scale-[0.98]"
+          >
+            确认加入
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function PendingArrangementMeta({
+  label,
+  value,
+}: {
+  label: string;
+  value: string;
+}) {
+  return (
+    <div className="flex items-start gap-2 rounded-[10px] bg-surface px-3 py-2">
+      <span className="w-12 shrink-0 text-xs leading-5 text-text-tertiary">
+        {label}
+      </span>
+      <span className="min-w-0 flex-1 break-words text-sm leading-5 text-text">
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function getPendingConfidenceLabel(
+  confidence: ArrangementPendingConfirmation["draft"]["result"]["confidence"]
+) {
+  if (confidence === "high") return "高可信";
+  if (confidence === "medium") return "需确认";
+  return "低可信";
+}
+
+function formatPendingArrangementTime(
+  result: ArrangementPendingConfirmation["draft"]["result"]
+) {
+  if (result.timeKind === "none") return "无明确时间";
+  if (result.timeKind === "range") {
+    const start = result.startAt ? formatPendingDateTime(result.startAt) : "";
+    const end = result.endAt ? formatPendingDateTime(result.endAt) : "";
+    if (start && end) return `${start} - ${end}`;
+    return start || end || "时间段待确认";
+  }
+  return result.dueAt ? formatPendingDateTime(result.dueAt) : "截止时间待确认";
+}
+
+function formatPendingDateTime(timestamp: number) {
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(timestamp));
 }
 
 function SearchScreen({
@@ -3110,9 +3374,13 @@ function MineActionCard({
 function SettingsScreen({
   onBack,
   onOpenAppearance,
+  arrangementAutoRecognitionEnabled,
+  onChangeArrangementAutoRecognition,
 }: {
   onBack: () => void;
   onOpenAppearance: () => void;
+  arrangementAutoRecognitionEnabled: boolean;
+  onChangeArrangementAutoRecognition: (enabled: boolean) => void;
 }) {
   const { localeCode, resolvedLocale, t } = usePreferences();
   const [showLanguageSheet, setShowLanguageSheet] = React.useState(false);
@@ -3136,6 +3404,12 @@ function SettingsScreen({
                 : getLocaleDisplayName(localeCode, resolvedLocale)
             }`}
             onClick={() => setShowLanguageSheet(true)}
+          />
+          <SettingsToggleItem
+            title="安排自动识别"
+            description="开启后，发给自己和私聊中的安排会自动生成到安排页"
+            checked={arrangementAutoRecognitionEnabled}
+            onChange={onChangeArrangementAutoRecognition}
           />
         </div>
       </div>
@@ -3377,6 +3651,49 @@ function SettingsListItem({
   );
 }
 
+function SettingsToggleItem({
+  title,
+  description,
+  checked,
+  onChange,
+}: {
+  title: string;
+  description: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() => onChange(!checked)}
+      className="flex min-h-[62px] w-full items-center border-b border-border-light px-3 text-left last:border-b-0 transition hover:bg-bg active:scale-[0.99]"
+      role="switch"
+      aria-checked={checked}
+    >
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-[15px] font-medium leading-5 text-text">{title}</p>
+        <p className="mt-1 truncate text-xs leading-4 text-text-tertiary">
+          {description}
+        </p>
+      </div>
+      <span
+        className={cn(
+          "ml-3 flex h-7 w-12 shrink-0 items-center rounded-full p-0.5 transition",
+          checked ? "bg-primary" : "bg-fill-3"
+        )}
+        aria-hidden="true"
+      >
+        <span
+          className={cn(
+            "h-6 w-6 rounded-full bg-white shadow-[0_1px_3px_rgba(15,23,42,0.18)] transition-transform",
+            checked && "translate-x-5"
+          )}
+        />
+      </span>
+    </button>
+  );
+}
+
 function MobilePageHeader({ title, onBack }: { title: string; onBack: () => void }) {
   const { t } = usePreferences();
 
@@ -3431,6 +3748,7 @@ function ThemePreview({ mode }: { mode: ResolvedTheme }) {
 function getTabLabel(page: PageType, t: ReturnType<typeof usePreferences>["t"]) {
   if (page === "records") return t("tabs.records");
   if (page === "insight") return t("tabs.insight");
+  if (page === "arrangements") return t("tabs.arrangements");
   return t("tabs.mine");
 }
 

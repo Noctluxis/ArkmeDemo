@@ -81,6 +81,7 @@ const translations: Record<string, Record<TranslationKey, string>> = {
   "zh-CN": {
     "tabs.records": "快记",
     "tabs.insight": "洞见",
+    "tabs.arrangements": "安排",
     "tabs.mine": "我的",
     "search.close": "关闭搜索",
     "search.placeholder": "搜索快记...",
@@ -273,6 +274,7 @@ const translations: Record<string, Record<TranslationKey, string>> = {
   "zh-TW": {
     "tabs.records": "快記",
     "tabs.insight": "洞見",
+    "tabs.arrangements": "安排",
     "tabs.mine": "我的",
     "search.close": "關閉搜尋",
     "search.placeholder": "搜尋快記...",
@@ -465,6 +467,7 @@ const translations: Record<string, Record<TranslationKey, string>> = {
   "en-US": {
     "tabs.records": "Notes",
     "tabs.insight": "Insight",
+    "tabs.arrangements": "Plans",
     "tabs.mine": "Me",
     "search.close": "Close search",
     "search.placeholder": "Search notes...",
@@ -657,6 +660,7 @@ const translations: Record<string, Record<TranslationKey, string>> = {
   "ar-SA": {
     "tabs.records": "ملاحظات",
     "tabs.insight": "رؤى",
+    "tabs.arrangements": "خطط",
     "tabs.mine": "أنا",
     "settings.title": "الإعدادات",
     "settings.appearance": "المظهر",
