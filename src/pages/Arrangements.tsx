@@ -1,10 +1,14 @@
 import React from "react";
 import {
   arrangementsStorageKey,
+  acceptMergeSuggestion,
   applyAutomaticArrangementRules,
+  buildCalendarBuckets,
   createArrangementItem,
+  findMergeSuggestions,
   formatArrangementTime,
   getInitialArrangements,
+  getReminderOccurrences,
   groupArrangementItems,
   isArrangementOverdue,
   persistArrangements,
@@ -16,6 +20,10 @@ import {
   type ArrangementItem,
   type ArrangementStatus,
   type ArrangementTimeKind,
+  type CalendarBucket,
+  type MergeSuggestion,
+  type ReminderOccurrence,
+  type ReminderRule,
 } from "@/data/arrangements";
 import { cn } from "@/lib/utils";
 
@@ -98,6 +106,9 @@ export default function Arrangements() {
     React.useState<ArrangementFormState>(emptyFormState);
   const [searchOpen, setSearchOpen] = React.useState(false);
   const [searchQuery, setSearchQuery] = React.useState("");
+  const [quickStatusView, setQuickStatusView] = React.useState<
+    "active" | "later" | "completed" | null
+  >(null);
   const [collapsedGroups, setCollapsedGroups] = React.useState<
     Record<CollapsibleGroupKey, boolean>
   >({
@@ -107,6 +118,15 @@ export default function Arrangements() {
     later: true,
     completed: true,
   });
+  const [viewMode, setViewMode] = React.useState<"list" | "calendar">("list");
+  const [calendarMonth, setCalendarMonth] = React.useState(() =>
+    startOfMonthTimestamp(now)
+  );
+  const [selectedCalendarDate, setSelectedCalendarDate] = React.useState<
+    string | null
+  >(null);
+  const [dismissedMergeSuggestionIds, setDismissedMergeSuggestionIds] =
+    React.useState<string[]>([]);
 
   React.useEffect(() => {
     persistArrangements(arrangements);
@@ -151,9 +171,63 @@ export default function Arrangements() {
   ).length;
   const laterCount = groups.later.length;
   const completedCount = groups.completed.length;
+  const quickStatusArrangements = React.useMemo(() => {
+    if (quickStatusView === "active") {
+      return arrangements.filter((arrangement) => arrangement.status === "active");
+    }
+    if (quickStatusView === "later") return groups.later;
+    if (quickStatusView === "completed") return groups.completed;
+    return [];
+  }, [arrangements, groups.completed, groups.later, quickStatusView]);
   const searchResults = React.useMemo(
     () => searchArrangementItems(arrangements, searchQuery),
     [arrangements, searchQuery]
+  );
+  const reminderOccurrences = React.useMemo(
+    () => getReminderOccurrences(arrangements, now),
+    [arrangements, now]
+  );
+  const mergeSuggestions = React.useMemo(
+    () =>
+      findMergeSuggestions(arrangements, now).filter(
+        (suggestion) => !dismissedMergeSuggestionIds.includes(suggestion.id)
+      ),
+    [arrangements, dismissedMergeSuggestionIds, now]
+  );
+  const mergedChildren = React.useMemo(
+    () =>
+      detailArrangement
+        ? arrangements.filter(
+            (arrangement) => arrangement.mergedIntoId === detailArrangement.id
+          )
+        : [],
+    [arrangements, detailArrangement]
+  );
+  const detailMergeSuggestion = detailArrangement
+    ? mergeSuggestions.find(
+        (suggestion) => suggestion.primaryArrangementId === detailArrangement.id
+      )
+    : undefined;
+  const monthRange = React.useMemo(
+    () => getMonthRange(calendarMonth),
+    [calendarMonth]
+  );
+  const calendarBuckets = React.useMemo(
+    () =>
+      buildCalendarBuckets(
+        arrangements,
+        monthRange.startAt,
+        monthRange.endAt
+      ),
+    [arrangements, monthRange.endAt, monthRange.startAt]
+  );
+  const selectedCalendarArrangements = React.useMemo(
+    () =>
+      selectedCalendarDate
+        ? calendarBuckets.find((bucket) => bucket.dateKey === selectedCalendarDate)
+            ?.arrangements ?? []
+        : [],
+    [calendarBuckets, selectedCalendarDate]
   );
   const toggleCollapsedGroup = React.useCallback((key: CollapsibleGroupKey) => {
     setCollapsedGroups((current) => ({
@@ -168,6 +242,81 @@ export default function Arrangements() {
     },
     []
   );
+
+  const addReminderRule = React.useCallback(
+    (id: string, rule: Omit<ReminderRule, "id" | "createdAt" | "updatedAt">) => {
+      const timestamp = Date.now();
+      setArrangements((current) =>
+        current.map((arrangement) =>
+          arrangement.id === id
+            ? {
+                ...arrangement,
+                reminderRules: [
+                  ...arrangement.reminderRules,
+                  {
+                    ...rule,
+                    id: `reminder-${timestamp.toString(36)}-${Math.random()
+                      .toString(36)
+                      .slice(2, 7)}`,
+                    createdAt: timestamp,
+                    updatedAt: timestamp,
+                  },
+                ],
+                updatedAt: timestamp,
+              }
+            : arrangement
+        )
+      );
+    },
+    []
+  );
+
+  const toggleReminderRule = React.useCallback((arrangementId: string, ruleId: string) => {
+    const timestamp = Date.now();
+    setArrangements((current) =>
+      current.map((arrangement) =>
+        arrangement.id === arrangementId
+          ? {
+              ...arrangement,
+              reminderRules: arrangement.reminderRules.map((rule) =>
+                rule.id === ruleId
+                  ? { ...rule, enabled: !rule.enabled, updatedAt: timestamp }
+                  : rule
+              ),
+              updatedAt: timestamp,
+            }
+          : arrangement
+      )
+    );
+  }, []);
+
+  const deleteReminderRule = React.useCallback((arrangementId: string, ruleId: string) => {
+    const timestamp = Date.now();
+    setArrangements((current) =>
+      current.map((arrangement) =>
+        arrangement.id === arrangementId
+          ? {
+              ...arrangement,
+              reminderRules: arrangement.reminderRules.filter(
+                (rule) => rule.id !== ruleId
+              ),
+              updatedAt: timestamp,
+            }
+          : arrangement
+      )
+    );
+  }, []);
+
+  const acceptArrangementMerge = React.useCallback((suggestion: MergeSuggestion) => {
+    setArrangements((current) => acceptMergeSuggestion(current, suggestion));
+    setDismissedMergeSuggestionIds((current) => [...current, suggestion.id]);
+  }, []);
+
+  const dismissMergeSuggestion = React.useCallback((id: string) => {
+    setDismissedMergeSuggestionIds((current) =>
+      current.includes(id) ? current : [...current, id]
+    );
+  }, []);
 
   const handleCreateArrangement = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -238,55 +387,96 @@ export default function Arrangements() {
   return (
     <div className="relative flex h-full min-h-0 flex-col overflow-hidden bg-bg">
       <header className="shrink-0 bg-bg px-4 pb-3 pt-4">
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <h1 className="text-xl font-semibold leading-7 text-text">安排</h1>
+        <div className="relative h-10">
+          <div className="absolute left-0 top-1/2 -translate-y-1/2">
+            <h1 className="text-[30px] font-semibold leading-9 text-text">安排</h1>
+          </div>
+          <div className="absolute left-1/2 top-1/2 w-[136px] -translate-x-1/2 -translate-y-1/2">
+            <ViewModeSwitch value={viewMode} onChange={setViewMode} compact />
           </div>
           <button
             type="button"
             onClick={openCreateArrangement}
-            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-primary text-xl leading-none text-on-primary shadow-sm transition active:scale-[0.96]"
+            className="absolute right-0 top-1/2 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full bg-primary text-xl leading-none text-on-primary shadow-sm transition active:scale-[0.96]"
             aria-label="新建安排"
           >
             +
           </button>
         </div>
         <div className="mt-4 grid grid-cols-3 gap-2">
-          <ArrangementStat label="进行中" value={activeCount} />
-          <ArrangementStat label="以后再说" value={laterCount} />
-          <ArrangementStat label="已完成" value={completedCount} />
+          <ArrangementStat
+            label="进行中"
+            value={activeCount}
+            onOpen={() => setQuickStatusView("active")}
+          />
+          <ArrangementStat
+            label="以后再说"
+            value={laterCount}
+            onOpen={() => setQuickStatusView("later")}
+          />
+          <ArrangementStat
+            label="已完成"
+            value={completedCount}
+            onOpen={() => setQuickStatusView("completed")}
+          />
         </div>
       </header>
 
-      <main className="min-h-0 flex-1 overflow-y-auto px-4 pb-6">
+      <main className="min-h-0 flex-1 overflow-y-auto px-4 pb-6 [scrollbar-gutter:stable]">
         <div className="space-y-5">
-          <ArrangementSearchLauncher onOpen={() => setSearchOpen(true)} />
-          {groupMeta.map((group) => {
-            const collapsible = collapsibleGroupKeys.includes(
-              group.key as CollapsibleGroupKey
-            );
-            const collapsed = collapsible
-              ? collapsedGroups[group.key as CollapsibleGroupKey]
-              : false;
-
-            return (
-              <ArrangementGroupSection
-                key={group.key}
-                title={group.title}
-                arrangements={groups[group.key]}
-                now={now}
-                collapsible={collapsible}
-                collapsed={collapsed}
-                onToggle={
-                  collapsible
-                    ? () => toggleCollapsedGroup(group.key as CollapsibleGroupKey)
-                    : undefined
+          {viewMode === "list" && (
+            <>
+              <ReminderBanner
+                occurrences={reminderOccurrences}
+                onDismiss={(occurrence) =>
+                  deleteReminderRule(occurrence.arrangement.id, occurrence.rule.id)
                 }
-                onOpenDetail={setDetailArrangementId}
-                onChangeStatus={applyArrangementStatus}
+                onOpen={(id) => setDetailArrangementId(id)}
               />
-            );
-          })}
+              <ArrangementSearchLauncher onOpen={() => setSearchOpen(true)} />
+            </>
+          )}
+          {viewMode === "list" ? (
+            groupMeta.map((group) => {
+              const collapsible = collapsibleGroupKeys.includes(
+                group.key as CollapsibleGroupKey
+              );
+              const collapsed = collapsible
+                ? collapsedGroups[group.key as CollapsibleGroupKey]
+                : false;
+
+              return (
+                <ArrangementGroupSection
+                  key={group.key}
+                  title={group.title}
+                  arrangements={groups[group.key]}
+                  now={now}
+                  collapsible={collapsible}
+                  collapsed={collapsed}
+                  onToggle={
+                    collapsible
+                      ? () => toggleCollapsedGroup(group.key as CollapsibleGroupKey)
+                      : undefined
+                  }
+                  onOpenDetail={setDetailArrangementId}
+                  onChangeStatus={applyArrangementStatus}
+                />
+              );
+            })
+          ) : (
+            <ArrangementCalendarView
+              monthStart={calendarMonth}
+              buckets={calendarBuckets}
+              now={now}
+              onPrevMonth={() =>
+                setCalendarMonth((current) => addMonths(current, -1))
+              }
+              onNextMonth={() =>
+                setCalendarMonth((current) => addMonths(current, 1))
+              }
+              onSelectDate={setSelectedCalendarDate}
+            />
+          )}
         </div>
       </main>
 
@@ -306,6 +496,14 @@ export default function Arrangements() {
         onEdit={openEditArrangement}
         onDelete={deleteArrangement}
         onChangeStatus={applyArrangementStatus}
+        mergeSuggestion={detailMergeSuggestion}
+        mergedChildren={mergedChildren}
+        allArrangements={arrangements}
+        onAcceptMerge={acceptArrangementMerge}
+        onDismissMerge={dismissMergeSuggestion}
+        onAddReminder={addReminderRule}
+        onToggleReminder={toggleReminderRule}
+        onDeleteReminder={deleteReminderRule}
       />
 
       <ArrangementSearchSheet
@@ -318,16 +516,407 @@ export default function Arrangements() {
         onOpenDetail={openSearchResult}
         onChangeStatus={applyArrangementStatus}
       />
+
+      <CalendarDaySheet
+        dateKey={selectedCalendarDate}
+        arrangements={selectedCalendarArrangements}
+        now={now}
+        onClose={() => setSelectedCalendarDate(null)}
+        onOpenDetail={(id) => {
+          setSelectedCalendarDate(null);
+          setDetailArrangementId(id);
+        }}
+        onChangeStatus={applyArrangementStatus}
+      />
+
+      <QuickStatusSheet
+        status={quickStatusView}
+        arrangements={quickStatusArrangements}
+        now={now}
+        onClose={() => setQuickStatusView(null)}
+        onOpenDetail={(id) => {
+          setQuickStatusView(null);
+          setDetailArrangementId(id);
+        }}
+        onChangeStatus={applyArrangementStatus}
+      />
     </div>
   );
 }
 
-function ArrangementStat({ label, value }: { label: string; value: number }) {
+function ReminderBanner({
+  occurrences,
+  onDismiss,
+  onOpen,
+}: {
+  occurrences: ReminderOccurrence[];
+  onDismiss: (occurrence: ReminderOccurrence) => void;
+  onOpen: (arrangementId: string) => void;
+}) {
+  if (occurrences.length === 0) return null;
+
   return (
-    <div className="rounded-[8px] bg-surface px-3 py-2 shadow-[var(--mine-card-shadow)]">
-      <p className="text-[18px] font-semibold leading-6 text-text">{value}</p>
-      <p className="mt-0.5 text-[11px] leading-4 text-text-tertiary">{label}</p>
+    <section className="rounded-[12px] border border-primary/20 bg-primary-soft px-3 py-3">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="text-[13px] font-semibold leading-5 text-primary">
+            提醒
+          </p>
+          <p className="mt-0.5 text-[12px] leading-5 text-text-muted">
+            {occurrences.length} 条安排到了应用内提醒时间
+          </p>
+        </div>
+      </div>
+      <div className="mt-2 space-y-2">
+        {occurrences.map((occurrence) => (
+          <div
+            key={occurrence.id}
+            className="rounded-[10px] border border-border-light bg-bg px-2.5 py-2 shadow-[var(--mine-card-shadow)]"
+          >
+            <div className="flex items-center justify-between gap-2">
+            <button
+              type="button"
+              onClick={() => onOpen(occurrence.arrangement.id)}
+              className="min-w-0 flex-1 text-left text-[13px] font-semibold leading-5 text-text"
+            >
+              {occurrence.title}
+            </button>
+            <button
+              type="button"
+              onClick={() => onDismiss(occurrence)}
+              className="h-7 rounded-full bg-surface px-2 text-[11px] font-semibold text-text-muted"
+            >
+              关闭
+            </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ViewModeSwitch({
+  value,
+  onChange,
+  compact,
+}: {
+  value: "list" | "calendar";
+  onChange: (value: "list" | "calendar") => void;
+  compact?: boolean;
+}) {
+  return (
+    <div
+      className={cn(
+        "grid grid-cols-2 rounded-[12px] bg-surface p-1 shadow-[var(--mine-card-shadow)]",
+        compact && "rounded-[10px]"
+      )}
+    >
+      {([
+        ["list", "列表"],
+        ["calendar", "日历"],
+      ] as const).map(([mode, label]) => (
+        <button
+          key={mode}
+          type="button"
+          onClick={() => onChange(mode)}
+          className={cn(
+            "rounded-[9px] font-semibold transition active:scale-[0.98]",
+            compact ? "h-8 text-[12px]" : "h-9 text-[13px]",
+            value === mode
+              ? "bg-bg text-text shadow-[var(--mine-card-shadow)]"
+              : "text-text-tertiary"
+          )}
+        >
+          {label}
+        </button>
+      ))}
     </div>
+  );
+}
+
+function ArrangementCalendarView({
+  monthStart,
+  buckets,
+  now,
+  onPrevMonth,
+  onNextMonth,
+  onSelectDate,
+}: {
+  monthStart: number;
+  buckets: CalendarBucket[];
+  now: number;
+  onPrevMonth: () => void;
+  onNextMonth: () => void;
+  onSelectDate: (dateKey: string) => void;
+}) {
+  const bucketMap = React.useMemo(
+    () => new Map(buckets.map((bucket) => [bucket.dateKey, bucket])),
+    [buckets]
+  );
+  const days = React.useMemo(() => buildMonthGrid(monthStart), [monthStart]);
+  const weekStart = startOfLocalDay(now);
+  const currentWeekKeys = Array.from({ length: 7 }, (_, index) =>
+    formatLocalDateKey(weekStart + index * 24 * 60 * 60 * 1000)
+  );
+
+  return (
+    <section className="space-y-3">
+      <div className="rounded-[12px] bg-surface px-3 py-3 shadow-[var(--mine-card-shadow)]">
+        <div className="mb-3 flex items-center justify-between">
+          <button
+            type="button"
+            onClick={onPrevMonth}
+            className="h-8 w-8 rounded-full bg-bg text-[16px] text-text-muted"
+            aria-label="上个月"
+          >
+            ‹
+          </button>
+          <p className="text-[14px] font-semibold text-text">
+            {formatMonthTitle(monthStart)}
+          </p>
+          <button
+            type="button"
+            onClick={onNextMonth}
+            className="h-8 w-8 rounded-full bg-bg text-[16px] text-text-muted"
+            aria-label="下个月"
+          >
+            ›
+          </button>
+        </div>
+        <div className="grid grid-cols-7 gap-1 text-center text-[11px] text-text-tertiary">
+          {["一", "二", "三", "四", "五", "六", "日"].map((day) => (
+            <span key={day}>{day}</span>
+          ))}
+        </div>
+        <div className="mt-2 grid grid-cols-7 gap-1">
+          {days.map((day) => {
+            const bucket = bucketMap.get(day.dateKey);
+            const bucketArrangements = bucket?.arrangements ?? [];
+            const isCurrentMonth = day.month === new Date(monthStart).getMonth();
+            const isToday = day.dateKey === formatLocalDateKey(now);
+            const hasAttentionArrangement = bucketArrangements.some(
+              (arrangement) =>
+                arrangement.status === "later" ||
+                isArrangementOverdue(arrangement, now)
+            );
+            return (
+              <button
+                key={day.dateKey}
+                type="button"
+                onClick={() => onSelectDate(day.dateKey)}
+                className={cn(
+                  "grid h-[64px] grid-rows-[1fr_2fr] overflow-hidden rounded-[8px] border text-center transition active:scale-[0.98]",
+                  isCurrentMonth
+                    ? "border-border bg-bg"
+                    : "border-transparent bg-transparent opacity-45",
+                  isToday &&
+                    "border-[#09B83E] bg-[#E6F7EE]/60 shadow-[var(--shadow-focus)]"
+                )}
+              >
+                <span
+                  className={cn(
+                    "flex h-full w-full items-center justify-center text-[12px] font-semibold leading-none text-text-muted",
+                    isToday && "text-[#09B83E]"
+                  )}
+                >
+                  {day.day}
+                </span>
+                <span className="flex h-full w-full items-start justify-center pt-0.5">
+                  {bucketArrangements.length > 0 ? (
+                    <span
+                      className={cn(
+                        "flex h-6 min-w-[30px] items-center justify-center rounded-[7px] px-2 text-[12px] font-semibold leading-none",
+                        hasAttentionArrangement
+                          ? "bg-[rgba(237,190,9,0.2)] text-warning"
+                          : "bg-primary-soft text-primary"
+                      )}
+                      aria-label={`${bucketArrangements.length} 条安排`}
+                    >
+                      {bucketArrangements.length}
+                    </span>
+                  ) : null}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <div className="rounded-[12px] bg-surface px-3 py-3 shadow-[var(--mine-card-shadow)]">
+        <p className="mb-2 text-[13px] font-semibold text-text">本周摘要</p>
+        <div className="space-y-2">
+          {currentWeekKeys.some((key) => bucketMap.has(key)) ? (
+            currentWeekKeys.map((key) => {
+              const bucket = bucketMap.get(key);
+              if (!bucket) return null;
+              return (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => onSelectDate(key)}
+                  className="flex w-full items-center justify-between gap-3 rounded-[8px] bg-bg px-3 py-2 text-left"
+                >
+                  <span className="text-[12px] font-medium text-text">{key}</span>
+                  <span className="text-[11px] text-text-tertiary">
+                    {bucket.arrangements.length} 条
+                  </span>
+                </button>
+              );
+            })
+          ) : (
+            <p className="text-[12px] leading-5 text-text-tertiary">
+              本周没有明确时间的安排。
+            </p>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function CalendarDaySheet({
+  dateKey,
+  arrangements,
+  now,
+  onClose,
+  onOpenDetail,
+  onChangeStatus,
+}: {
+  dateKey: string | null;
+  arrangements: ArrangementItem[];
+  now: number;
+  onClose: () => void;
+  onOpenDetail: (id: string) => void;
+  onChangeStatus: (id: string, status: ArrangementStatus) => void;
+}) {
+  if (!dateKey) return null;
+
+  return (
+    <div className="absolute inset-0 z-40 flex items-end justify-center">
+      <button
+        type="button"
+        className="absolute inset-0 bg-overlay-light"
+        onClick={onClose}
+        aria-label="关闭当天安排"
+      />
+      <section className="relative z-10 max-h-[calc(100%-12px)] w-full overflow-y-auto rounded-t-[18px] bg-bg px-4 pb-5 pt-4 shadow-lift [scrollbar-gutter:stable]">
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="text-base font-semibold text-text">{dateKey}</h2>
+          <button
+            type="button"
+            onClick={onClose}
+            className="h-9 rounded-full border border-border-light bg-surface px-3 text-[12px] font-semibold text-text-muted"
+          >
+            关闭
+          </button>
+        </div>
+        <div className="space-y-2">
+          {arrangements.length > 0 ? (
+            arrangements.map((arrangement) => (
+              <ArrangementRow
+                key={arrangement.id}
+                arrangement={arrangement}
+                now={now}
+                onOpen={() => onOpenDetail(arrangement.id)}
+                onChangeStatus={onChangeStatus}
+              />
+            ))
+          ) : (
+            <ArrangementSearchEmpty title="这一天没有明确时间的安排" />
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function QuickStatusSheet({
+  status,
+  arrangements,
+  now,
+  onClose,
+  onOpenDetail,
+  onChangeStatus,
+}: {
+  status: "active" | "later" | "completed" | null;
+  arrangements: ArrangementItem[];
+  now: number;
+  onClose: () => void;
+  onOpenDetail: (id: string) => void;
+  onChangeStatus: (id: string, status: ArrangementStatus) => void;
+}) {
+  if (!status) return null;
+  const title =
+    status === "active" ? "进行中" : status === "later" ? "以后再说" : "已完成";
+
+  return (
+    <div className="absolute inset-0 z-40 flex items-end justify-center">
+      <button
+        type="button"
+        className="absolute inset-0 bg-overlay-light"
+        onClick={onClose}
+        aria-label="关闭快速查看"
+      />
+      <section className="relative z-10 flex max-h-[calc(100%-12px)] w-full flex-col overflow-hidden rounded-t-[18px] bg-bg shadow-lift">
+        <div className="shrink-0 px-4 pb-3 pt-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-base font-semibold text-text">
+              {title} · {arrangements.length}
+            </h2>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="h-9 rounded-full border border-border-light bg-surface px-3 text-[12px] font-semibold text-text-muted shadow-[var(--mine-card-shadow)]"
+          >
+            关闭
+          </button>
+        </div>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-5 [scrollbar-gutter:stable]">
+        <div className="space-y-2">
+          {arrangements.length > 0 ? (
+            arrangements.map((arrangement) => (
+              <ArrangementRow
+                key={arrangement.id}
+                arrangement={arrangement}
+                now={now}
+                onOpen={() => onOpenDetail(arrangement.id)}
+                onChangeStatus={onChangeStatus}
+              />
+            ))
+          ) : (
+            <ArrangementSearchEmpty title={`暂无${title}安排`} />
+          )}
+        </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ArrangementStat({
+  label,
+  value,
+  onOpen,
+}: {
+  label: string;
+  value: number;
+  onOpen: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className="rounded-[8px] bg-surface px-3 py-2 text-left shadow-[var(--mine-card-shadow)] transition hover:bg-surface-muted active:scale-[0.98]"
+    >
+      <p className="text-[18px] font-semibold leading-6 text-text">{value}</p>
+      <p className="mt-0.5 flex items-center justify-between gap-1 text-[11px] leading-4 text-text-tertiary">
+        <span>{label}</span>
+        <span aria-hidden="true">›</span>
+      </p>
+    </button>
   );
 }
 
@@ -410,7 +999,7 @@ function ArrangementSearchSheet({
           </div>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
+        <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3 [scrollbar-gutter:stable]">
           {!trimmedQuery ? (
             <ArrangementSearchEmpty title="输入关键词开始搜索" />
           ) : results.length === 0 ? (
@@ -605,7 +1194,9 @@ function StatusPill({
       ? "已完成"
       : status === "later"
         ? "以后再说"
-        : overdue
+        : status === "merged"
+          ? "已合并"
+          : overdue
           ? "已逾期"
           : "进行中";
 
@@ -617,7 +1208,9 @@ function StatusPill({
           ? "bg-fill-3 text-text-tertiary"
           : status === "later"
             ? "bg-surface-muted text-text-muted"
-            : overdue
+            : status === "merged"
+              ? "bg-fill-3 text-text-tertiary"
+              : overdue
               ? "bg-[rgba(237,190,9,0.16)] text-text-muted"
               : "bg-primary-soft text-primary"
       )}
@@ -680,7 +1273,7 @@ function CreateArrangementSheet({
       />
       <form
         onSubmit={onSubmit}
-        className="relative z-10 max-h-[calc(100%-12px)] w-full overflow-y-auto rounded-t-[18px] bg-bg px-4 pb-5 pt-4 shadow-lift"
+        className="relative z-10 max-h-[calc(100%-12px)] w-full overflow-y-auto rounded-t-[18px] bg-bg px-4 pb-5 pt-4 shadow-lift [scrollbar-gutter:stable]"
       >
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-base font-semibold text-text">
@@ -801,6 +1394,14 @@ function ArrangementDetailSheet({
   onEdit,
   onDelete,
   onChangeStatus,
+  mergeSuggestion,
+  mergedChildren,
+  allArrangements,
+  onAcceptMerge,
+  onDismissMerge,
+  onAddReminder,
+  onToggleReminder,
+  onDeleteReminder,
 }: {
   arrangement: ArrangementItem | undefined;
   now: number;
@@ -808,6 +1409,17 @@ function ArrangementDetailSheet({
   onEdit: (arrangement: ArrangementItem) => void;
   onDelete: (id: string) => void;
   onChangeStatus: (id: string, status: ArrangementStatus) => void;
+  mergeSuggestion?: MergeSuggestion;
+  mergedChildren: ArrangementItem[];
+  allArrangements: ArrangementItem[];
+  onAcceptMerge: (suggestion: MergeSuggestion) => void;
+  onDismissMerge: (id: string) => void;
+  onAddReminder: (
+    id: string,
+    rule: Omit<ReminderRule, "id" | "createdAt" | "updatedAt">
+  ) => void;
+  onToggleReminder: (arrangementId: string, ruleId: string) => void;
+  onDeleteReminder: (arrangementId: string, ruleId: string) => void;
 }) {
   const [deleteConfirming, setDeleteConfirming] = React.useState(false);
 
@@ -827,7 +1439,8 @@ function ArrangementDetailSheet({
         onClick={onClose}
         aria-label="关闭安排详情"
       />
-      <div className="relative z-10 max-h-[calc(100%-12px)] w-full overflow-y-auto rounded-t-[18px] bg-bg px-4 pb-5 pt-4 shadow-lift">
+      <div className="relative z-10 flex max-h-[calc(100%-12px)] w-full flex-col overflow-hidden rounded-t-[18px] bg-bg shadow-lift">
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-5 pt-4 [scrollbar-gutter:stable]">
         <div className="mb-3 flex items-start justify-between gap-3">
           <div className="min-w-0">
             <p className="text-[12px] text-text-tertiary">安排详情</p>
@@ -900,9 +1513,18 @@ function ArrangementDetailSheet({
           )}
           <DetailBlock label="时间">
             <p className="text-[13px] leading-5 text-text">
+              <span className="mr-2 rounded-full bg-primary-soft px-2 py-1 text-[11px] text-primary">
+                {getTimeKindLabel(arrangement)}
+              </span>
               {formatArrangementTime(arrangement)}
             </p>
           </DetailBlock>
+          <ReminderRulesBlock
+            arrangement={arrangement}
+            onAddReminder={onAddReminder}
+            onToggleReminder={onToggleReminder}
+            onDeleteReminder={onDeleteReminder}
+          />
           {(arrangement.location || arrangement.people.length > 0) && (
             <DetailBlock label="地点与相关人">
               <div className="flex flex-wrap gap-1.5">
@@ -925,6 +1547,33 @@ function ArrangementDetailSheet({
               V1 默认由用户完成。AI 辅助和代办会在后续版本分层呈现。
             </p>
           </DetailBlock>
+          {mergeSuggestion && (
+            <MergeSuggestionBlock
+              suggestion={mergeSuggestion}
+              arrangements={allArrangements}
+              onAccept={onAcceptMerge}
+              onDismiss={onDismissMerge}
+            />
+          )}
+          {mergedChildren.length > 0 && (
+            <DetailBlock label="被合并项">
+              <div className="space-y-2">
+                {mergedChildren.map((child) => (
+                  <div
+                    key={child.id}
+                    className="rounded-[8px] bg-surface-muted px-3 py-2"
+                  >
+                    <p className="text-[12px] font-medium text-text">
+                      {child.title}
+                    </p>
+                    <p className="mt-1 text-[12px] leading-5 text-text-muted">
+                      已保留为可追溯记录，默认不进入列表和日历。
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </DetailBlock>
+          )}
           {arrangement.sourceRefs.length > 0 && (
             <DetailBlock label="来源上下文">
               <div className="space-y-2">
@@ -970,6 +1619,7 @@ function ArrangementDetailSheet({
             />
           )}
         </div>
+        </div>
       </div>
     </div>
   );
@@ -987,6 +1637,216 @@ function DetailBlock({
       <p className="mb-1.5 text-[12px] font-medium text-text-tertiary">{label}</p>
       {children}
     </section>
+  );
+}
+
+function ReminderRulesBlock({
+  arrangement,
+  onAddReminder,
+  onToggleReminder,
+  onDeleteReminder,
+}: {
+  arrangement: ArrangementItem;
+  onAddReminder: (
+    id: string,
+    rule: Omit<ReminderRule, "id" | "createdAt" | "updatedAt">
+  ) => void;
+  onToggleReminder: (arrangementId: string, ruleId: string) => void;
+  onDeleteReminder: (arrangementId: string, ruleId: string) => void;
+}) {
+  const canUseTimeBasedReminder = arrangement.timeKind !== "none";
+  const defaultSameDayMinutes = getArrangementDefaultReminderMinutes(arrangement);
+  const [manualTimeInput, setManualTimeInput] = React.useState(() =>
+    formatMinutesOfDay(defaultSameDayMinutes)
+  );
+  const [manualSettingOpen, setManualSettingOpen] = React.useState(false);
+
+  React.useEffect(() => {
+    setManualTimeInput(formatMinutesOfDay(defaultSameDayMinutes));
+    setManualSettingOpen(false);
+  }, [arrangement.id, defaultSameDayMinutes]);
+
+  const manualMinutes = parseTimeInputToMinutes(manualTimeInput);
+  const displayedSameDayMinutes = manualMinutes ?? defaultSameDayMinutes;
+
+  return (
+    <DetailBlock label="提醒">
+      {arrangement.reminderRules.length > 0 && (
+        <div className="mb-2 space-y-1.5">
+          {arrangement.reminderRules.map((rule) => (
+            <div
+              key={rule.id}
+              className={cn(
+                "flex w-full items-center justify-between gap-2 rounded-[8px] px-3 py-2 text-left text-[12px]",
+                rule.enabled
+                  ? "bg-primary-soft text-primary"
+                  : "bg-surface-muted text-text-tertiary"
+              )}
+            >
+              <span className="min-w-0 flex-1 truncate font-semibold">
+                {formatReminderRuleLabel(rule)}
+              </span>
+              <div className="flex shrink-0 items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => onToggleReminder(arrangement.id, rule.id)}
+                  className={cn(
+                    "h-7 rounded-full px-2.5 text-[11px] font-semibold transition active:scale-[0.98]",
+                    rule.enabled
+                      ? "bg-bg text-primary"
+                      : "bg-bg text-text-muted"
+                  )}
+                >
+                  {rule.enabled ? "关闭" : "开启"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onDeleteReminder(arrangement.id, rule.id)}
+                  className="h-7 rounded-full bg-[rgba(244,99,99,0.1)] px-2.5 text-[11px] font-semibold text-danger transition active:scale-[0.98]"
+                >
+                  删除
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="grid grid-cols-2 gap-2">
+        <ReminderQuickButton
+          label="提前30分钟"
+          disabled={!canUseTimeBasedReminder}
+          onClick={() =>
+            onAddReminder(arrangement.id, {
+              type: "before",
+              enabled: true,
+              offsetMinutes: 30,
+            })
+          }
+        />
+        <ReminderQuickButton
+          label="提前1小时"
+          disabled={!canUseTimeBasedReminder}
+          onClick={() =>
+            onAddReminder(arrangement.id, {
+              type: "before",
+              enabled: true,
+              offsetMinutes: 60,
+            })
+          }
+        />
+        <ReminderQuickButton
+          label={`手动设定：当天${formatMinutesOfDay(displayedSameDayMinutes)}`}
+          disabled={!canUseTimeBasedReminder}
+          className="col-span-2"
+          onClick={() => setManualSettingOpen((open) => !open)}
+        />
+      </div>
+      {manualSettingOpen && (
+        <div className="mt-2 flex items-center gap-2 rounded-[8px] bg-surface-muted px-2 py-2">
+          <input
+            type="time"
+            value={manualTimeInput}
+            onChange={(event) => setManualTimeInput(event.target.value)}
+            className="h-9 min-w-0 flex-1 rounded-[8px] border border-transparent bg-bg px-2 text-[13px] text-text outline-none focus:border-primary/30"
+          />
+          <button
+            type="button"
+            disabled={manualMinutes === null}
+            onClick={() => {
+              if (manualMinutes === null) return;
+              onAddReminder(arrangement.id, {
+                type: "same-day",
+                enabled: true,
+                timeOfDayMinutes: manualMinutes,
+              });
+              setManualSettingOpen(false);
+            }}
+            className="h-9 rounded-full bg-primary px-3 text-[12px] font-semibold text-on-primary disabled:opacity-50"
+          >
+            保存
+          </button>
+        </div>
+      )}
+    </DetailBlock>
+  );
+}
+
+function ReminderQuickButton({
+  label,
+  disabled,
+  className,
+  onClick,
+}: {
+  label: string;
+  disabled?: boolean;
+  className?: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={onClick}
+      className={cn(
+        "h-9 rounded-full bg-surface-muted px-2 text-[12px] font-semibold text-text transition active:scale-[0.98] disabled:text-text-tertiary disabled:opacity-60",
+        className
+      )}
+    >
+      {label}
+    </button>
+  );
+}
+
+function MergeSuggestionBlock({
+  suggestion,
+  arrangements,
+  onAccept,
+  onDismiss,
+}: {
+  suggestion: MergeSuggestion;
+  arrangements: ArrangementItem[];
+  onAccept: (suggestion: MergeSuggestion) => void;
+  onDismiss: (id: string) => void;
+}) {
+  const candidateItems = suggestion.candidateArrangementIds
+    .map((id) => arrangements.find((arrangement) => arrangement.id === id))
+    .filter((arrangement): arrangement is ArrangementItem => Boolean(arrangement));
+
+  if (candidateItems.length === 0) return null;
+
+  return (
+    <DetailBlock label="相似安排">
+      <p className="text-[12px] leading-5 text-text-muted">{suggestion.reason}</p>
+      <div className="mt-2 space-y-1.5">
+        {candidateItems.map((arrangement) => (
+          <div
+            key={arrangement.id}
+            className="rounded-[8px] bg-surface-muted px-3 py-2"
+          >
+            <p className="text-[12px] font-medium text-text">{arrangement.title}</p>
+            <p className="mt-1 text-[11px] text-text-tertiary">
+              {formatArrangementTime(arrangement)}
+            </p>
+          </div>
+        ))}
+      </div>
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        <button
+          type="button"
+          onClick={() => onAccept(suggestion)}
+          className="h-9 rounded-full bg-primary text-[12px] font-semibold text-on-primary"
+        >
+          合并
+        </button>
+        <button
+          type="button"
+          onClick={() => onDismiss(suggestion.id)}
+          className="h-9 rounded-full bg-surface-muted text-[12px] font-semibold text-text-muted"
+        >
+          忽略
+        </button>
+      </div>
+    </DetailBlock>
   );
 }
 
@@ -1160,4 +2020,118 @@ function toDateTimeInputValue(timestamp: number | null) {
   const date = new Date(timestamp);
   const localDate = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
   return localDate.toISOString().slice(0, 16);
+}
+
+function getTimeKindLabel(arrangement: ArrangementItem) {
+  if (arrangement.timeKind === "range") return "时间段";
+  if (arrangement.timeKind === "due") return "截止时间";
+  return "无明确时间";
+}
+
+function formatReminderRuleLabel(rule: ReminderRule) {
+  if (rule.type === "before") {
+    return `提前${rule.offsetMinutes ?? 0}分钟`;
+  }
+  if (rule.type === "same-day") {
+    return `当天${formatMinutesOfDay(rule.timeOfDayMinutes ?? 9 * 60)}`;
+  }
+  return `${rule.recurrence === "weekly" ? "每周" : "每天"}${formatMinutesOfDay(
+    rule.timeOfDayMinutes ?? 9 * 60
+  )}`;
+}
+
+function getArrangementDefaultReminderMinutes(arrangement: ArrangementItem) {
+  const timestamp =
+    arrangement.timeKind === "range"
+      ? arrangement.startAt
+      : arrangement.timeKind === "due"
+        ? arrangement.dueAt
+        : null;
+  if (!timestamp) return 9 * 60;
+  const date = new Date(timestamp);
+  return date.getHours() * 60 + date.getMinutes();
+}
+
+function parseTimeInputToMinutes(value: string) {
+  const [hourText, minuteText] = value.split(":");
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  if (
+    !Number.isInteger(hour) ||
+    !Number.isInteger(minute) ||
+    hour < 0 ||
+    hour > 23 ||
+    minute < 0 ||
+    minute > 59
+  ) {
+    return null;
+  }
+  return hour * 60 + minute;
+}
+
+function formatMinutesOfDay(minutes: number) {
+  const hour = String(Math.floor(minutes / 60)).padStart(2, "0");
+  const minute = String(minutes % 60).padStart(2, "0");
+  return `${hour}:${minute}`;
+}
+
+function startOfMonthTimestamp(timestamp: number) {
+  const date = new Date(timestamp);
+  date.setDate(1);
+  date.setHours(0, 0, 0, 0);
+  return date.getTime();
+}
+
+function getMonthRange(monthStart: number) {
+  const start = new Date(monthStart);
+  const end = new Date(monthStart);
+  end.setMonth(end.getMonth() + 1, 0);
+  end.setHours(23, 59, 59, 999);
+  return {
+    startAt: start.getTime(),
+    endAt: end.getTime(),
+  };
+}
+
+function addMonths(timestamp: number, amount: number) {
+  const date = new Date(timestamp);
+  date.setMonth(date.getMonth() + amount);
+  return startOfMonthTimestamp(date.getTime());
+}
+
+function buildMonthGrid(monthStart: number) {
+  const firstDay = new Date(monthStart);
+  const startWeekday = (firstDay.getDay() + 6) % 7;
+  const gridStart = startOfLocalDay(monthStart - startWeekday * 24 * 60 * 60 * 1000);
+  return Array.from({ length: 42 }, (_, index) => {
+    const timestamp = gridStart + index * 24 * 60 * 60 * 1000;
+    const date = new Date(timestamp);
+    return {
+      timestamp,
+      dateKey: formatLocalDateKey(timestamp),
+      day: date.getDate(),
+      month: date.getMonth(),
+    };
+  });
+}
+
+function startOfLocalDay(timestamp: number) {
+  const date = new Date(timestamp);
+  date.setHours(0, 0, 0, 0);
+  return date.getTime();
+}
+
+function formatLocalDateKey(timestamp: number) {
+  const date = new Date(timestamp);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function formatMonthTitle(timestamp: number) {
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "long",
+  }).format(timestamp);
 }
